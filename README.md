@@ -23,15 +23,16 @@ of this CLI, so neither needs the other.
 ## The plan workflow
 
 ```bash
-gh yith plan                                   # writes .git/yith/plan-<PR>.json
-$EDITOR .git/yith/plan-1670.json               # set class and reply per thread
-gh yith show .git/yith/plan-1670.json          # exactly what will be posted
-gh yith post .git/yith/plan-1670.json          # dry run, sends nothing
-gh yith post .git/yith/plan-1670.json --yes    # send
+gh yith plan                          # writes the plan and prints its path
+$EDITOR PLAN                          # set class and reply per thread
+gh yith post PLAN                     # dry run: live check, prints an approval code
+gh yith post PLAN --approve CODE      # send exactly that plan
+gh yith show PLAN                     # the plan file as written, offline; after posting, with results
 ```
 
-The plan lives inside `.git`, so it is never committed. Each entry gets a
-class and a reply:
+`plan` writes into the repository's git directory, or the worktree's own git
+directory in a worktree, so the plan is never committed. `-o FILE` puts it
+somewhere else. Each entry gets a class and a reply:
 
 | class | reply | what `post` does |
 | --- | --- | --- |
@@ -42,23 +43,60 @@ class and a reply:
 | HUMAN | empty | nothing |
 | HUMAN | text | reply as a question, leave open |
 
-`"resolve": false` on an entry means reply only. Delete an entry to leave
-that thread alone.
+`"resolve": false`, a JSON boolean, means reply only. Delete an entry to
+leave that thread alone; the dry run lists every open thread the plan leaves
+out.
 
 ## Why a plan file
 
-Every write to GitHub goes through `post`, which sends only what the plan
-says:
+What the CLI enforces, whoever or whatever drives it:
 
-- **You see the exact text first.** `show` prints the plan the way it will be posted.
-- **Dry run by default.** `post` without `--yes` checks every entry against the live PR and sends nothing.
-- **All or nothing up front.** A malformed entry, a thread that is not on the PR, or one you cannot resolve rejects the whole plan before anything is sent.
-- **No double posts.** A reply already on the thread and a thread already resolved are skipped, so re-running after a failure is safe.
-- **A record.** Each entry's result is written back into the plan file.
+- **Only what was approved is sent.** `post` without `--approve` is a dry run.
+  It checks the plan against the live PR and prints exactly what it would send
+  now, using each live thread's own path, line and comment, then an approval
+  code. The code is a hash of that exact send: every reply and resolution,
+  which threads, and the PR's head commit. `post --approve CODE` checks again
+  and sends only if the result still matches. Any edit that changes what
+  would be sent, a thread resolved or reopened since, or a new push changes
+  the code, so the send is refused and nothing goes out.
+- **All or nothing up front.** A malformed entry, an entry whose id and path
+  point at different threads, a thread that is not on the PR, or one you lack
+  permission for rejects the whole plan before anything is sent.
+- **No double posts from a plan file.** A reply or resolution this plan file
+  already sent is never sent again, even if the plan is edited. Each write is
+  recorded before it is sent, so after an interrupted send the next dry run
+  checks whether it reached GitHub. A thread resolved on GitHub in the
+  meantime is left alone.
+- **One send per PR at a time.** A lock per PR for your user, kept in
+  `~/.cache/yith/locks` and taken before the plan is read, stops two sends to
+  the same PR from overlapping, whichever plan file or copy they use. A send that waited for the lock re-checks live
+  state, so a copy approved alongside the original is refused once the
+  original has posted.
+- **A record.** What was sent is written into the plan after each step,
+  including when a send fails or is stopped with Ctrl-C, SIGTERM or SIGHUP.
+- **No hidden text.** Replies may only contain letters, digits, punctuation,
+  symbols, ordinary spaces, newlines and accents; zero-width, text-direction,
+  variation-selector and other invisible characters are refused. Third-party
+  text shown in the terminal, including file paths, escapes exactly the
+  characters a reply would refuse, so whatever it shows plainly is visible.
 
-When an AI agent fills the plan, a review comment that tries to talk the
-agent into posting something can at worst get text into the plan. You read
-the plan before anything is sent.
+What it cannot enforce:
+
+- The approval code is not a secret: whoever runs the dry run sees it, agent
+  included. It proves nothing changed since that output; it cannot prove you
+  read it. The skill tells the agent to show you the dry run and wait.
+- A process killed with SIGKILL leaves its lock behind and may not record the
+  step it was on. A reply that is already the latest on its thread is still
+  skipped.
+- Two machines, or two different home directories, sending to the same PR at
+  once are not coordinated.
+- The single `reply` and `resolve` commands post without a plan at all.
+
+When an AI agent fills the plan, a review comment that tries to talk the agent
+into posting something through the plan gets no further than the dry run,
+which shows the text next to the live comment it answers. That does not stop
+a manipulated agent from editing code, using `reply` or `resolve` directly, or
+approving its own dry run; the skill's rules and your own review cover those.
 
 ## Single operations
 
@@ -79,8 +117,9 @@ shows everyone.
 
 ## Compatibility
 
-`list -f json` output and plan files carry a schema number, currently 1. A
-change that breaks either one bumps that number and the minor version.
+`list -f json` output carries a schema number, currently 1, and plan files
+carry their own, currently 2. A change that breaks either one bumps that
+number and the minor version.
 
 This repo is the source of truth for the CLI. The yith skill bundles
 byte-identical copies of `gh-yith` and `tests/test_yith.py`; after a change
