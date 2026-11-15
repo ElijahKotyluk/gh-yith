@@ -1,0 +1,885 @@
+#!/usr/bin/env python3
+"""yith: triage pull request review threads, then post the result in one checked batch.
+
+Works in any git checkout with an authenticated GitHub CLI (gh).
+No dependencies beyond python3 (3.8+) and gh. Not tied to any AI agent:
+JSON output is for agents, table output is for people.
+
+The same file ships two ways, and each works without the other:
+  - the gh-yith GitHub CLI extension, run as `gh yith`
+    https://github.com/ElijahKotyluk/gh-yith (source of truth)
+  - bundled with the yith agent skill, run as `scripts/yith`
+    https://github.com/ElijahKotyluk/yith
+
+Plan workflow (recommended):
+  plan           write a plan file with one entry per open review thread
+  show           print a plan the way it will be posted; sends nothing
+  post           send exactly what the plan says; dry run unless --yes
+
+Single operations:
+  list           review threads on a PR (default: bot accounts only)
+  reply          reply on one thread, optionally resolving it
+  resolve        resolve threads with a reason
+  unresolve      reopen threads
+  rerequest      ask the Copilot reviewer to review the PR again
+
+Run with `<subcommand> --help` for details.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+
+VERSION = "0.3.0"
+
+
+def command_name():
+    """How to refer to this tool in hints: `gh yith` for the extension, else the path used."""
+    invoked = sys.argv[0] if sys.argv and sys.argv[0] else "yith"
+    base = os.path.basename(invoked)
+    if base == "gh-yith":
+        return "gh yith"
+    if base == "yith":
+        return invoked
+    return "yith"
+LIST_SCHEMA = 1
+PLAN_SCHEMA = 1
+
+PLAN_CLASSES = ("FIX", "WONT_FIX", "INVALID", "HUMAN")
+CLASS_REASON = {"FIX": "ADDRESSED", "WONT_FIX": "WONT_FIX", "INVALID": "INVALID"}
+MAX_REPLY = 65000
+
+COPILOT_REVIEWER = "copilot-pull-request-reviewer[bot]"
+PR_URL_RE = re.compile(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+SUGGESTION_RE = re.compile(r"```suggestion[^\n]*\n(.*?)```", re.DOTALL)
+
+REASONS = {
+    "addressed": "ADDRESSED",
+    "wontfix": "WONT_FIX",
+    "wont-fix": "WONT_FIX",
+    "wont_fix": "WONT_FIX",
+    "invalid": "INVALID",
+}
+
+LIST_QUERY = """
+query($owner:String!, $repo:String!, $number:Int!, $after:String) {
+  viewer { login }
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      url title state headRefName baseRefName headRefOid isCrossRepository isDraft
+      reviewThreads(first:100, after:$after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id isResolved isOutdated path line startLine originalLine diffSide
+          subjectType viewerCanReply viewerCanResolve
+          comments(first:100) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id databaseId body createdAt url
+              author { login __typename }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+MORE_COMMENTS_QUERY = """
+query($id:ID!, $after:String) {
+  node(id:$id) {
+    ... on PullRequestReviewThread {
+      comments(first:100, after:$after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id databaseId body createdAt url
+          author { login __typename }
+        }
+      }
+    }
+  }
+}
+"""
+
+REPLY_MUTATION = """
+mutation($id:ID!, $body:String!) {
+  addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id, body:$body}) {
+    comment { url }
+  }
+}
+"""
+
+RESOLVE_MUTATION = """
+mutation($id:ID!, $reason:PullRequestReviewThreadResolutionReason) {
+  resolveReviewThread(input:{threadId:$id, resolutionReason:$reason}) {
+    thread { id isResolved }
+  }
+}
+"""
+
+UNRESOLVE_MUTATION = """
+mutation($id:ID!) {
+  unresolveReviewThread(input:{threadId:$id}) {
+    thread { id isResolved }
+  }
+}
+"""
+
+
+class YithError(Exception):
+    """A failure to report to the user. Carries an exit code."""
+
+    def __init__(self, msg, code=1):
+        Exception.__init__(self, msg)
+        self.code = code
+
+
+def die(msg, code=1):
+    raise YithError(msg, code)
+
+
+def gh(args, stdin=None):
+    try:
+        proc = subprocess.run(
+            ["gh"] + args, input=stdin, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        die(
+            "gh not found. Install the GitHub CLI (https://cli.github.com) "
+            "and run `gh auth login`."
+        )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip()
+        die("`gh %s` failed:\n%s" % (" ".join(args[:2]), err))
+    return proc.stdout
+
+
+def graphql(query, variables):
+    payload = json.dumps({"query": query, "variables": variables})
+    out = gh(["api", "graphql", "--input", "-"], stdin=payload)
+    data = json.loads(out)
+    if data.get("errors"):
+        die("GraphQL: " + "; ".join(e.get("message", "?") for e in data["errors"]))
+    return data["data"]
+
+
+def split_repo(value):
+    if not value or "/" not in value:
+        die("--repo must look like OWNER/NAME")
+    owner, name = value.split("/", 1)
+    return owner, name
+
+
+def resolve_pr(pr_arg, repo_flag):
+    """Return (owner, repo, number) from a URL, a number, or the current branch."""
+    if pr_arg:
+        match = PR_URL_RE.search(pr_arg)
+        if match:
+            return match.group(1), match.group(2), int(match.group(3))
+        if pr_arg.lstrip("#").isdigit():
+            number = int(pr_arg.lstrip("#"))
+            if repo_flag:
+                owner, repo = split_repo(repo_flag)
+            else:
+                out = gh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+                owner, repo = split_repo(out.strip())
+            return owner, repo, number
+        die("could not parse PR %r (give a number or a GitHub PR URL)" % pr_arg)
+    args = ["pr", "view", "--json", "url", "--jq", ".url"]
+    if repo_flag:
+        args += ["--repo", repo_flag]
+    url = gh(args).strip()
+    match = PR_URL_RE.search(url)
+    if not match:
+        die("no pull request found for the current branch; pass a PR number or URL")
+    return match.group(1), match.group(2), int(match.group(3))
+
+
+def fetch_threads(owner, repo, number):
+    threads, after, pr = [], None, None
+    while True:
+        data = graphql(
+            LIST_QUERY,
+            {"owner": owner, "repo": repo, "number": number, "after": after},
+        )
+        pull = data["repository"]["pullRequest"]
+        if pull is None:
+            die("PR #%d not found in %s/%s" % (number, owner, repo))
+        if pr is None:
+            pr = {
+                "owner": owner,
+                "repo": repo,
+                "number": number,
+                "url": pull["url"],
+                "title": pull["title"],
+                "state": pull["state"],
+                "head": pull["headRefName"],
+                "head_sha": pull["headRefOid"],
+                "base": pull["baseRefName"],
+                "from_fork": pull["isCrossRepository"],
+                "draft": pull["isDraft"],
+                "viewer": data["viewer"]["login"],
+            }
+        conn = pull["reviewThreads"]
+        for node in conn["nodes"]:
+            comments = node["comments"]
+            while comments["pageInfo"]["hasNextPage"]:
+                more = graphql(
+                    MORE_COMMENTS_QUERY,
+                    {"id": node["id"], "after": comments["pageInfo"]["endCursor"]},
+                )["node"]["comments"]
+                node["comments"]["nodes"].extend(more["nodes"])
+                comments = more
+            threads.append(node)
+        if not conn["pageInfo"]["hasNextPage"]:
+            break
+        after = conn["pageInfo"]["endCursor"]
+    return pr, threads
+
+
+def shape_thread(node):
+    comments = []
+    for c in node["comments"]["nodes"]:
+        author = c.get("author") or {}
+        comments.append(
+            {
+                "id": c["id"],
+                "author": author.get("login", "ghost"),
+                "author_type": author.get("__typename", "Unknown"),
+                "body": c["body"],
+                "created_at": c["createdAt"],
+                "url": c["url"],
+            }
+        )
+    first = comments[0] if comments else {}
+    author = first.get("author", "ghost")
+    suggestions = []
+    for c in comments:
+        if c["author"] == author:
+            suggestions.extend(SUGGESTION_RE.findall(c["body"]))
+    return {
+        "id": node["id"],
+        "state": "resolved" if node["isResolved"] else "open",
+        "outdated": node["isOutdated"],
+        "subject_type": node["subjectType"],
+        "path": node["path"],
+        "line": node["line"],
+        "start_line": node["startLine"],
+        "original_line": node["originalLine"],
+        "side": node["diffSide"],
+        "viewer_can_reply": node["viewerCanReply"],
+        "viewer_can_resolve": node["viewerCanResolve"],
+        "author": author,
+        "author_type": first.get("author_type", "Unknown"),
+        "url": first.get("url"),
+        "body": first.get("body", ""),
+        "suggestions": suggestions,
+        "replies": comments[1:],
+    }
+
+
+def truncate_bodies(threads, limit):
+    if not limit:
+        return
+    marker = "\n[... truncated by yith --max-body %d]" % limit
+    for t in threads:
+        if len(t["body"]) > limit:
+            t["body"] = t["body"][:limit] + marker
+        for r in t["replies"]:
+            if len(r["body"]) > limit:
+                r["body"] = r["body"][:limit] + marker
+
+
+def thread_matches(thread, author_re, all_authors):
+    """Default: threads started by bot accounts. --author: regex on login."""
+    if all_authors:
+        return True
+    if author_re is not None:
+        return bool(author_re.search(thread["author"]))
+    return thread["author_type"] == "Bot"
+
+
+def compile_author(pattern):
+    if not pattern:
+        return None
+    try:
+        return re.compile(pattern, re.I)
+    except re.error as exc:
+        die("bad --author regex: %s" % exc)
+
+
+def select_threads(nodes, author_re, all_authors, include_resolved=False, exclude_outdated=False):
+    threads = []
+    for node in nodes:
+        thread = shape_thread(node)
+        if thread["state"] == "resolved" and not include_resolved:
+            continue
+        if thread["outdated"] and exclude_outdated:
+            continue
+        if not thread_matches(thread, author_re, all_authors):
+            continue
+        threads.append(thread)
+    return threads
+
+
+def cmd_list(args):
+    author_re = compile_author(args.author)
+    owner, repo, number = resolve_pr(args.pr, args.repo)
+    pr, nodes = fetch_threads(owner, repo, number)
+    threads = select_threads(
+        nodes, author_re, args.all_authors, args.include_resolved, args.exclude_outdated
+    )
+    if args.limit:
+        threads = threads[: args.limit]
+    truncate_bodies(threads, args.max_body)
+    result = {"schema": LIST_SCHEMA, "pr": pr, "threads": threads}
+    if args.format == "json":
+        json.dump(result, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    elif args.format == "md":
+        print_markdown(result)
+    else:
+        print_table(result)
+    if args.fail_if_open and any(t["state"] == "open" for t in threads):
+        return 2
+    return 0
+
+
+def first_line(text, width=72):
+    line = text.strip().splitlines()[0] if text.strip() else ""
+    line = re.sub(r"\s+", " ", line)
+    return line if len(line) <= width else line[: width - 3] + "..."
+
+
+def print_table(result):
+    pr = result["pr"]
+    sys.stdout.write(
+        "PR #%d %s [%s] (%s -> %s, head %s%s)\n%s\n\n"
+        % (
+            pr["number"],
+            pr["title"],
+            pr["state"],
+            pr["head"],
+            pr["base"],
+            pr["head_sha"][:10],
+            ", from a fork" if pr["from_fork"] else "",
+            pr["url"],
+        )
+    )
+    threads = result["threads"]
+    if not threads:
+        sys.stdout.write("no matching review threads\n")
+        return
+    for i, t in enumerate(threads, 1):
+        flags = t["state"] + (", outdated" if t["outdated"] else "")
+        if t["subject_type"] == "FILE":
+            flags += ", whole file"
+        if t["side"] == "LEFT":
+            flags += ", base side"
+        if t["state"] == "open" and not t["viewer_can_resolve"]:
+            flags += ", cannot resolve"
+        loc = "%s:%s" % (t["path"], t["line"] if t["line"] is not None else "?")
+        sys.stdout.write("%2d. [%s] %s  by %s\n" % (i, flags, loc, t["author"]))
+        sys.stdout.write("    %s\n" % first_line(t["body"]))
+        if t["suggestions"]:
+            sys.stdout.write("    (%d suggested change%s)\n" % (len(t["suggestions"]), "" if len(t["suggestions"]) == 1 else "s"))
+        if t["replies"]:
+            sys.stdout.write("    %d repl%s, last by %s\n" % (len(t["replies"]), "y" if len(t["replies"]) == 1 else "ies", t["replies"][-1]["author"]))
+        sys.stdout.write("    id %s\n" % t["id"])
+    sys.stdout.write("\n%d thread%s\n" % (len(threads), "" if len(threads) == 1 else "s"))
+
+
+def print_markdown(result):
+    pr = result["pr"]
+    sys.stdout.write("# PR #%d: %s\n\n%s\n\n" % (pr["number"], pr["title"], pr["url"]))
+    if not result["threads"]:
+        sys.stdout.write("No matching review threads.\n")
+        return
+    for i, t in enumerate(result["threads"], 1):
+        flags = t["state"] + (", outdated" if t["outdated"] else "")
+        loc = "%s:%s" % (t["path"], t["line"] if t["line"] is not None else "?")
+        sys.stdout.write("## %d. `%s` (%s) by %s\n\n" % (i, loc, flags, t["author"]))
+        sys.stdout.write("thread id: `%s`  \nurl: %s\n\n" % (t["id"], t["url"]))
+        sys.stdout.write("\n".join("> " + line for line in t["body"].splitlines()) + "\n\n")
+        for r in t["replies"]:
+            sys.stdout.write("**%s replied:**\n\n" % r["author"])
+            sys.stdout.write("\n".join("> " + line for line in r["body"].splitlines()) + "\n\n")
+
+
+def read_body(args):
+    if args.body is not None:
+        return args.body
+    if args.body_file:
+        if args.body_file == "-":
+            return sys.stdin.read()
+        with open(args.body_file, "r", encoding="utf-8") as fh:
+            return fh.read()
+    die("provide a reply with -m/--body or --body-file (use --body-file - for stdin)")
+
+
+def cmd_reply(args):
+    body = read_body(args).strip()
+    if not body:
+        die("reply body is empty")
+    if args.dry_run:
+        sys.stdout.write("DRY RUN, nothing sent. Would reply on %s:\n%s\n" % (args.thread_id, body))
+        if args.resolve:
+            sys.stdout.write("Would then resolve it with reason %s.\n" % args.resolve)
+        return 0
+    data = graphql(REPLY_MUTATION, {"id": args.thread_id, "body": body})
+    url = data["addPullRequestReviewThreadReply"]["comment"]["url"]
+    sys.stdout.write("replied: %s\n" % url)
+    sys.stdout.flush()
+    if args.resolve:
+        try:
+            do_resolve([args.thread_id], args.resolve)
+        except YithError as exc:
+            die(
+                "the reply above WAS posted (%s) but resolving failed, do not re-post it:\n%s"
+                % (url, exc),
+                exc.code,
+            )
+    return 0
+
+
+def do_resolve(thread_ids, reason):
+    for thread_id in thread_ids:
+        data = graphql(RESOLVE_MUTATION, {"id": thread_id, "reason": reason})
+        thread = data["resolveReviewThread"]["thread"]
+        sys.stdout.write(
+            "resolved (%s): %s\n" % (reason or "no reason", thread["id"])
+        )
+
+
+def cmd_resolve(args):
+    if args.dry_run:
+        for thread_id in args.thread_ids:
+            sys.stdout.write("DRY RUN, nothing sent. Would resolve %s (%s).\n" % (thread_id, args.reason))
+        return 0
+    do_resolve(args.thread_ids, args.reason)
+    return 0
+
+
+def cmd_unresolve(args):
+    if args.dry_run:
+        for thread_id in args.thread_ids:
+            sys.stdout.write("DRY RUN, nothing sent. Would unresolve %s.\n" % thread_id)
+        return 0
+    for thread_id in args.thread_ids:
+        data = graphql(UNRESOLVE_MUTATION, {"id": thread_id})
+        sys.stdout.write("unresolved: %s\n" % data["unresolveReviewThread"]["thread"]["id"])
+    return 0
+
+
+def cmd_rerequest(args):
+    owner, repo, number = resolve_pr(args.pr, args.repo)
+    reviewer = args.reviewer
+    if args.dry_run:
+        sys.stdout.write(
+            "DRY RUN, nothing sent. Would request a review from %s on %s/%s#%d.\n"
+            % (reviewer, owner, repo, number)
+        )
+        return 0
+    gh(
+        [
+            "api",
+            "-X",
+            "POST",
+            "repos/%s/%s/pulls/%d/requested_reviewers" % (owner, repo, number),
+            "-f",
+            "reviewers[]=%s" % reviewer,
+        ]
+    )
+    sys.stdout.write("re-requested review from %s on %s/%s#%d\n" % (reviewer, owner, repo, number))
+    return 0
+
+
+def normalize_body(text):
+    return (text or "").replace("\r\n", "\n").strip()
+
+
+def git_dir():
+    try:
+        proc = subprocess.run(["git", "rev-parse", "--git-dir"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return os.path.abspath(proc.stdout.strip())
+
+
+def default_plan_path(number):
+    gdir = git_dir()
+    if not gdir:
+        return None
+    return os.path.join(gdir, "yith", "plan-%d.json" % number)
+
+
+def build_plan(pr, threads, now=None):
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return {
+        "yith_plan": PLAN_SCHEMA,
+        "created": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pr": {
+            "owner": pr["owner"],
+            "repo": pr["repo"],
+            "number": pr["number"],
+            "url": pr["url"],
+            "head_sha": pr["head_sha"],
+        },
+        "how_to": (
+            "For each thread set class to FIX, WONT_FIX, INVALID or HUMAN and write reply. "
+            "FIX needs a reply. WONT_FIX or INVALID with an empty reply resolves without replying. "
+            "HUMAN is never resolved; a reply on it is posted as a question. "
+            "Set resolve to false to reply without resolving. Delete an entry to leave it untouched. "
+            "Review with `%s show FILE`, send with `%s post FILE --yes`." % (command_name(), command_name())
+        ),
+        "threads": [
+            {
+                "id": t["id"],
+                "path": t["path"],
+                "line": t["line"],
+                "author": t["author"],
+                "url": t["url"],
+                "comment": first_line(t["body"], 200),
+                "class": "",
+                "reply": "",
+            }
+            for t in threads
+        ],
+    }
+
+
+def normalize_class(value):
+    cls = re.sub(r"[\s-]+", "_", (value or "").strip().upper())
+    return "WONT_FIX" if cls == "WONTFIX" else cls
+
+
+def plan_actions(plan):
+    """Validate a plan. Return [(entry, class, reply or None, reason or None)]."""
+    if not isinstance(plan, dict) or plan.get("yith_plan") != PLAN_SCHEMA:
+        die('not a yith plan file (expected "yith_plan": %d)' % PLAN_SCHEMA)
+    pr = plan.get("pr") or {}
+    for key in ("owner", "repo", "number"):
+        if key not in pr:
+            die("plan is missing pr.%s" % key)
+    entries = plan.get("threads")
+    if not isinstance(entries, list):
+        die("plan has no threads list")
+    problems, seen, actions = [], set(), []
+    for i, entry in enumerate(entries, 1):
+        tid = entry.get("id") if isinstance(entry, dict) else None
+        if not tid:
+            problems.append("entry %d has no id" % i)
+            continue
+        if tid in seen:
+            problems.append("%s appears more than once" % tid)
+            continue
+        seen.add(tid)
+        cls = normalize_class(entry.get("class"))
+        reply = normalize_body(entry.get("reply"))
+        if cls not in PLAN_CLASSES:
+            problems.append(
+                "%s: class %r is not one of %s" % (tid, entry.get("class"), ", ".join(PLAN_CLASSES))
+            )
+            continue
+        if len(reply) > MAX_REPLY:
+            problems.append("%s: reply is longer than %d characters" % (tid, MAX_REPLY))
+            continue
+        if cls == "FIX" and not reply:
+            problems.append("%s: FIX needs a reply that says what changed" % tid)
+            continue
+        reason = None
+        if cls in CLASS_REASON and entry.get("resolve", True) is not False:
+            reason = CLASS_REASON[cls]
+        actions.append((entry, cls, reply or None, reason))
+    if problems:
+        die("plan is not ready, nothing was sent:\n  " + "\n  ".join(problems))
+    return actions
+
+
+def describe(reply, reason):
+    if reply and reason:
+        return "reply + resolve (%s)" % reason.lower()
+    if reply:
+        return "reply, leave open"
+    if reason:
+        return "resolve (%s), no reply" % reason.lower()
+    return "no action"
+
+
+def load_plan(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        die("plan file not found: %s" % path)
+    except ValueError as exc:
+        die("plan file is not valid JSON (%s): %s" % (path, exc))
+
+
+def save_plan(path, plan):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(plan, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def cmd_plan(args):
+    author_re = compile_author(args.author)
+    owner, repo, number = resolve_pr(args.pr, args.repo)
+    pr, nodes = fetch_threads(owner, repo, number)
+    if pr["state"] != "OPEN":
+        die("PR #%d is %s; nothing to plan" % (number, pr["state"].lower()))
+    threads = select_threads(nodes, author_re, args.all_authors)
+    plan = build_plan(pr, threads)
+    if args.output == "-":
+        json.dump(plan, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+    path = args.output or default_plan_path(number)
+    if not path:
+        die("not inside a git checkout; pass -o FILE (or -o - for stdout)")
+    if os.path.exists(path) and not args.force:
+        die("a plan already exists at %s; edit it, or pass --force to start over" % path)
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        os.makedirs(parent)
+    save_plan(path, plan)
+    sys.stdout.write(
+        "plan written: %s (%d open thread%s)\n"
+        % (path, len(threads), "" if len(threads) == 1 else "s")
+    )
+    return 0
+
+
+def cmd_show(args):
+    plan = load_plan(args.plan)
+    actions = plan_actions(plan)
+    pr = plan["pr"]
+    sys.stdout.write("Plan for %s/%s#%s  %s\n\n" % (pr["owner"], pr["repo"], pr["number"], pr.get("url", "")))
+    replies = resolves = 0
+    for i, (entry, cls, reply, reason) in enumerate(actions, 1):
+        loc = "%s:%s" % (entry.get("path"), entry.get("line") if entry.get("line") is not None else "?")
+        sys.stdout.write("%2d. %-8s %s  [%s]\n" % (i, cls, loc, describe(reply, reason)))
+        if entry.get("comment"):
+            sys.stdout.write("    comment: %s\n" % first_line(entry["comment"], 100))
+        if reply:
+            replies += 1
+            for line in reply.splitlines():
+                sys.stdout.write("    > %s\n" % line)
+        if reason:
+            resolves += 1
+        if entry.get("result"):
+            sys.stdout.write("    result: %s\n" % entry["result"])
+    sys.stdout.write(
+        "\n%d repl%s and %d resolution%s planned. show sends nothing; "
+        "send with: %s post %s --yes\n"
+        % (
+            replies,
+            "y" if replies == 1 else "ies",
+            resolves,
+            "" if resolves == 1 else "s",
+            command_name(),
+            args.plan,
+        )
+    )
+    return 0
+
+
+def thread_has_reply(thread, viewer, body):
+    target = normalize_body(body)
+    comments = [{"author": thread["author"], "body": thread["body"]}] + thread["replies"]
+    return any(c["author"] == viewer and normalize_body(c["body"]) == target for c in comments)
+
+
+def preflight(plan, actions, pr, nodes):
+    """Match plan entries to the live PR. Return steps or die before sending anything."""
+    if pr["state"] != "OPEN":
+        die("PR #%d is %s; nothing was sent" % (pr["number"], pr["state"].lower()))
+    by_id = dict((n["id"], shape_thread(n)) for n in nodes)
+    viewer = pr["viewer"]
+    problems, steps = [], []
+    for entry, cls, reply, reason in actions:
+        thread = by_id.get(entry["id"])
+        if thread is None:
+            problems.append("%s is not a review thread on this PR" % entry["id"])
+            continue
+        notes = []
+        if reply and thread_has_reply(thread, viewer, reply):
+            notes.append("reply already posted")
+            reply = None
+        if reason and thread["state"] == "resolved":
+            notes.append("already resolved")
+            reason = None
+        if reply and not thread["viewer_can_reply"]:
+            problems.append("%s: you cannot reply on this thread" % entry["id"])
+        if reason and not thread["viewer_can_resolve"]:
+            problems.append(
+                '%s: you cannot resolve this thread; set "resolve": false on it to reply only'
+                % entry["id"]
+            )
+        steps.append((entry, reply, reason, notes))
+    if problems:
+        die("nothing was sent:\n  " + "\n  ".join(problems))
+    return steps
+
+
+def cmd_post(args):
+    plan = load_plan(args.plan)
+    actions = plan_actions(plan)
+    ppr = plan["pr"]
+    pr, nodes = fetch_threads(ppr["owner"], ppr["repo"], int(ppr["number"]))
+    steps = preflight(plan, actions, pr, nodes)
+    if ppr.get("head_sha") and ppr["head_sha"] != pr["head_sha"]:
+        sys.stdout.write(
+            "note: the PR head moved since this plan was written (%s -> %s); "
+            "check FIX replies still describe the code\n"
+            % (ppr["head_sha"][:10], pr["head_sha"][:10])
+        )
+    if not args.yes:
+        sys.stdout.write("DRY RUN, nothing sent. Add --yes to send:\n")
+        for i, (entry, reply, reason, notes) in enumerate(steps, 1):
+            extra = " (skipping: %s)" % ", ".join(notes) if notes else ""
+            sys.stdout.write("%2d. %s  %s%s\n" % (i, entry["id"], describe(reply, reason), extra))
+        return 0
+    sent = 0
+    for i, (entry, reply, reason, notes) in enumerate(steps):
+        done = list(notes)
+        try:
+            if reply:
+                data = graphql(REPLY_MUTATION, {"id": entry["id"], "body": reply})
+                done.append("replied %s" % data["addPullRequestReviewThreadReply"]["comment"]["url"])
+                sent += 1
+            if reason:
+                graphql(RESOLVE_MUTATION, {"id": entry["id"], "reason": reason})
+                done.append("resolved (%s)" % reason.lower())
+                sent += 1
+        except YithError as exc:
+            done.append("FAILED: %s" % str(exc).splitlines()[-1])
+            entry["result"] = "; ".join(done)
+            for later, _, _, _ in steps[i + 1:]:
+                later["result"] = "not attempted"
+            save_plan(args.plan, plan)
+            die(
+                "stopped at %s: %s\nresults written to %s. Re-running post is safe: "
+                "anything already posted is skipped." % (entry["id"], exc, args.plan),
+                exc.code,
+            )
+        entry["result"] = "; ".join(done) if done else "no action"
+        save_plan(args.plan, plan)
+        sys.stdout.write("%s: %s\n" % (entry["id"], entry["result"]))
+    sys.stdout.write("done: %d write%s sent to GitHub\n" % (sent, "" if sent == 1 else "s"))
+    return 0
+
+
+def reason_type(value):
+    key = (value or "").strip().lower()
+    if not key:
+        die("reason must be one of: addressed, wontfix, invalid (got an empty value)")
+    if key not in REASONS:
+        die("reason must be one of: addressed, wontfix, invalid")
+    return REASONS[key]
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=command_name(),
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version="yith %s" % VERSION)
+    sub = parser.add_subparsers(dest="command", metavar="<subcommand>")
+    sub.required = True
+
+    def add_dry_run(p):
+        p.add_argument("-n", "--dry-run", action="store_true", help="print what would be sent to GitHub and send nothing")
+
+    def add_pr_args(p):
+        p.add_argument("pr", nargs="?", help="PR number or URL (default: PR for the current branch)")
+        p.add_argument("--repo", help="OWNER/NAME when giving a bare PR number outside its checkout")
+
+    p = sub.add_parser("plan", help="write a plan file for the open review threads on a PR")
+    add_pr_args(p)
+    p.add_argument("--author", help="regex on author login, instead of the default bot-account filter")
+    p.add_argument("--all-authors", action="store_true", help="include every author, humans too")
+    p.add_argument("-o", "--output", help="plan file path, or - for stdout (default: .git/yith/plan-<PR>.json)")
+    p.add_argument("--force", action="store_true", help="overwrite an existing plan file")
+    p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("show", help="print a plan the way it will be posted; sends nothing")
+    p.add_argument("plan", help="plan file")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("post", help="send exactly what a plan says; dry run unless --yes")
+    p.add_argument("plan", help="plan file")
+    p.add_argument("--yes", action="store_true", help="actually send to GitHub")
+    p.set_defaults(func=cmd_post)
+
+    p = sub.add_parser("list", help="list review threads on a PR")
+    add_pr_args(p)
+    p.add_argument(
+        "--author",
+        help="case-insensitive regex on the thread author login, instead of the default bot-account filter",
+    )
+    p.add_argument("--all-authors", action="store_true", help="include every author, humans too")
+    p.add_argument("--include-resolved", action="store_true", help="also list resolved threads")
+    p.add_argument("--exclude-outdated", action="store_true", help="drop threads on lines that no longer exist in the diff")
+    p.add_argument("-f", "--format", choices=["json", "table", "md"], default="json")
+    p.add_argument("--limit", type=int, default=0, help="list at most N threads")
+    p.add_argument("--max-body", type=int, default=0, help="truncate comment bodies to N characters")
+    p.add_argument("--fail-if-open", action="store_true", help="exit 2 when any listed thread is still open (for CI gates)")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("reply", help="reply on a thread (and optionally resolve it)")
+    p.add_argument("thread_id", help="thread id from `list`")
+    p.add_argument("-m", "--body", help="reply text")
+    p.add_argument("--body-file", help="file with the reply text, or - for stdin")
+    p.add_argument(
+        "--resolve",
+        nargs="?",
+        const="ADDRESSED",
+        type=reason_type,
+        help="also resolve the thread; optional reason: addressed (default), wontfix, invalid",
+    )
+    add_dry_run(p)
+    p.set_defaults(func=cmd_reply)
+
+    p = sub.add_parser("resolve", help="resolve one or more threads")
+    p.add_argument("thread_ids", nargs="+")
+    p.add_argument("--reason", type=reason_type, default="ADDRESSED", help="addressed (default), wontfix, invalid")
+    add_dry_run(p)
+    p.set_defaults(func=cmd_resolve)
+
+    p = sub.add_parser("unresolve", help="reopen one or more threads")
+    p.add_argument("thread_ids", nargs="+")
+    add_dry_run(p)
+    p.set_defaults(func=cmd_unresolve)
+
+    p = sub.add_parser("rerequest", help="request a fresh review from the Copilot reviewer")
+    add_pr_args(p)
+    p.add_argument("--reviewer", default=COPILOT_REVIEWER, help="reviewer login (default: %s)" % COPILOT_REVIEWER)
+    add_dry_run(p)
+    p.set_defaults(func=cmd_rerequest)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+        return args.func(args)
+    except YithError as exc:
+        sys.stderr.write("yith: %s\n" % exc)
+        return exc.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
